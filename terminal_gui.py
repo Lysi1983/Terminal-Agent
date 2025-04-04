@@ -1,10 +1,10 @@
 import tkinter as tk
 from tkinter import scrolledtext, ttk, font
-from threading import Thread
+from threading import Thread, Event
 import datetime
 import os
 import crud_cmd
-import json
+import psutil
 
 class TerminalGUI:
     def __init__(self, root):
@@ -19,6 +19,12 @@ class TerminalGUI:
         self.input_bg = "#3c3f41"
         self.accent_color = "#4b6eaf"
         self.output_bg = "#262626"
+        
+        # For tracking command execution
+        self.current_command_thread = None
+        self.command_running = False
+        self.stop_event = Event()
+        self.current_process = None
         
         # Configure styles
         self.configure_styles()
@@ -168,7 +174,9 @@ class TerminalGUI:
         self.update_output(f"\n[{timestamp}] > {command}\n")
         
         # Execute in separate thread to keep GUI responsive
-        Thread(target=self.process_command, args=(command,)).start()
+        self.current_command_thread = Thread(target=self.process_command, args=(command,))
+        self.current_command_thread.start()
+        self.command_running = True
     
     def process_command(self, command):
         """Process the command in a separate thread"""
@@ -395,10 +403,73 @@ class TerminalGUI:
                         except ValueError:
                             result = "Error: Timeout must be an integer value in seconds"
                 
+                case "findstr" | "searchtext" | "findtext" | "grep":
+                    if not args:
+                        result = "Error: Please provide search text and optional parameters"
+                    else:
+                        # Parse all arguments, looking for named parameters
+                        parts = args.split()
+                        text = parts[0] if parts else ""
+                        directory = "."
+                        file_pattern = "*.*"
+                        recursive = False
+                        case_sensitive = False
+                        whole_word = False
+                        
+                        # Process remaining arguments
+                        for i in range(1, len(parts)):
+                            arg = parts[i]
+                            
+                            # Check for named parameters
+                            if arg.lower().startswith("recursive="):
+                                recursive = arg.split("=")[1].lower() in ("true", "yes", "1")
+                            elif arg.lower().startswith("case_sensitive="):
+                                case_sensitive = arg.split("=")[1].lower() in ("true", "yes", "1")
+                            elif arg.lower().startswith("whole_word="):
+                                whole_word = arg.split("=")[1].lower() in ("true", "yes", "1")
+                            elif arg.lower().startswith("pattern="):
+                                file_pattern = arg.split("=")[1]
+                            # If not a named parameter, check if it's a directory or file pattern
+                            elif os.path.isdir(arg):
+                                directory = arg
+                            elif "*" in arg or "?" in arg:
+                                file_pattern = arg
+                            else:
+                                # If doesn't fit other categories, assume it's part of directory path
+                                directory = arg
+                        
+                        # Call the function with all parameters
+                        result = crud_cmd.find_text_in_files(
+                            text, 
+                            directory=directory,
+                            file_pattern=file_pattern,
+                            recursive=recursive,
+                            case_sensitive=case_sensitive,
+                            whole_word=whole_word
+                        )
+                
+                case "kill":
+                    if not args:
+                        result = "Error: Please specify a process ID to kill"
+                    else:
+                        try:
+                            pid = int(args)
+                            result = self.kill_process(pid)
+                        except ValueError:
+                            result = "Error: Process ID must be an integer"
+                
                 case "help":
                     result = """Available commands:
 list/ls/dir/directory/show [directory] - List files in directory
 find/search [directory] pattern - Find files matching pattern
+findstr/searchtext/findtext/grep text [dir] [pattern] - Search text in files
+  Named parameters:
+  - recursive=true - Search in subdirectories
+  - case_sensitive=true - Case-sensitive search
+  - whole_word=true - Match whole words only
+  - pattern=*.py - Specify file pattern to search
+  Example: findstr import . *.py
+  Example with params: findstr lysi recursive=true pattern=*.py
 read filename - Read file contents
 tree/structure [directory] - Show directory structure recursively
 disk/storage [path] - Show disk usage information
@@ -417,6 +488,7 @@ scan/ports/scanports host [start_port] [end_port] [timeout] - Scan ports on a ho
 processes/ps/tasklist - List running processes
 get/http_get url [params] [headers] [timeout] - Send HTTP GET request
 post/http_post url [data] [headers] [timeout] - Send HTTP POST request
+kill pid - Kill a process by its ID
 help - Show this help message"""
                 
                 case _:
@@ -441,6 +513,8 @@ help - Show this help message"""
             with open(os.path.join(self.log_dir, f"error_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.log"), "w") as f:
                 f.write(f"Command: {command}\n")
                 f.write(f"Error: {str(e)}\n")
+        finally:
+            self.command_running = False
     
     def update_output(self, text):
         """Update the output text widget"""
@@ -477,3 +551,25 @@ help - Show this help message"""
         self.command_entry.delete(0, tk.END)
         self.command_entry.insert(0, self.command_history[self.history_position])
         return "break"
+    
+    def kill_command(self):
+        """Kill the currently running command"""
+        if self.command_running and self.current_process:
+            try:
+                self.current_process.terminate()
+                self.update_output("Command terminated.\n")
+            except Exception as e:
+                self.update_output(f"Error terminating command: {str(e)}\n")
+    
+    def kill_process(self, pid):
+        """Kill a process by its PID"""
+        try:
+            process = psutil.Process(pid)
+            process.terminate()
+            return f"Process {pid} terminated."
+        except psutil.NoSuchProcess:
+            return f"No such process: {pid}"
+        except psutil.AccessDenied:
+            return f"Access denied to terminate process: {pid}"
+        except Exception as e:
+            return f"Error terminating process {pid}: {str(e)}"
