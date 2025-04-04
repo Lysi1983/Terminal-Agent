@@ -7,7 +7,13 @@ import time
 import datetime
 import requests
 import json
+import psutil
+import signal
+import sys
 from pathlib import Path
+
+# Global variable to track current subprocess
+current_process = None
 
 def is_windows():
     """Check if the current operating system is Windows"""
@@ -414,6 +420,7 @@ def get_user_info():
         username = getpass.getuser()
         computer_name = socket.gethostname()
         
+        
         return f"Username: {username}\nComputer name: {computer_name}"
     except Exception as e:
         return f"Error getting user information: {str(e)}"
@@ -561,7 +568,186 @@ def http_post_request(url, data=None, json_data=None, headers=None, timeout=30):
     except Exception as e:
         return f"Unexpected error during POST request: {str(e)}"
 
+def find_text_in_files(text, directory='.', file_pattern='*.*', recursive=False, case_sensitive=False, whole_word=False, line_numbers=True):
+    """
+    Search for text within files using Windows findstr command.
+    Args:
+        text: Text to search for in files
+        directory: Directory path to search in (default: current directory)
+        file_pattern: File pattern to search in (default: all files)
+        recursive: Whether to search recursively in subdirectories (default: False)
+        case_sensitive: Whether the search is case-sensitive (default: False)
+        whole_word: Whether to match whole words only (default: False)
+        line_numbers: Whether to display line numbers in results (default: True)
+    Returns:
+        Results of text search with file names, line numbers, and matching lines
+    """
+    if not is_windows():
+        return "This function is only available on Windows systems. Use grep on Unix/Linux."
+    
+    if not os.path.exists(directory):
+        return f"Error: Directory '{directory}' does not exist"
+    
+    try:
+        # Build findstr command with appropriate options
+        cmd = ['findstr']
+        options = []
+        
+        if recursive:
+            options.append('/S')  # Recursive search
+        
+        if not case_sensitive:
+            options.append('/I')  # Case-insensitive
+        
+        if line_numbers:
+            options.append('/N')  # Show line numbers
+        
+        if whole_word:
+            options.append('/W')  # Match whole words
+        
+        options.append('/P')  # Skip files with non-printable characters
+        
+        # Combine options
+        cmd.extend(options)
+        
+        # Add the search string
+        cmd.append(text)
+        
+        # Add file pattern
+        file_path = os.path.join(directory, file_pattern)
+        cmd.append(file_path)
+        
+        # Run command
+        result = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+        
+        # Process and format the output
+        if result.returncode == 0 or result.returncode == 1:  # 0=found matches, 1=no matches
+            output = result.stdout.strip()
+            
+            if not output:
+                return f"No files containing '{text}' found in {directory}"
+            
+            # Format output for better readability
+            formatted_lines = []
+            for line in output.split('\n'):
+                if line.strip():
+                    formatted_lines.append(line)
+            
+            return '\n'.join(formatted_lines)
+        else:
+            return f"Error searching files: {result.stderr}"
+    except Exception as e:
+        return f"Error searching for text: {str(e)}"
+
+def run_long_command(cmd, shell=False, timeout=None):
+    """
+    Run a command that could take a long time and allow for termination.
+    Args:
+        cmd: Command to run (list or string)
+        shell: Whether to run the command in a shell
+        timeout: Optional timeout in seconds
+    Returns:
+        Command output or error message
+    """
+    global current_process
+    
+    try:
+        # Start the process
+        current_process = subprocess.Popen(
+            cmd,
+            shell=shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        # Wait for it to complete with optional timeout
+        try:
+            stdout, stderr = current_process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            current_process.kill()
+            stdout, stderr = current_process.communicate()
+            return f"Command timed out after {timeout} seconds.\nPartial output:\n{stdout}"
+        
+        if current_process.returncode == 0:
+            return stdout
+        else:
+            return f"Command failed with exit code {current_process.returncode}.\nError: {stderr}"
+    
+    except Exception as e:
+        return f"Error executing command: {str(e)}"
+    finally:
+        current_process = None
+
+def terminate_process(pid):
+    """
+    Terminate a process by its PID.
+    Args:
+        pid: Process ID to terminate
+    Returns:
+        Success or error message
+    """
+    try:
+        process = psutil.Process(pid)
+        process_name = process.name()
+        
+        # Try to terminate nicely first
+        process.terminate()
+        
+        # Give it some time to terminate
+        gone, still_alive = psutil.wait_procs([process], timeout=3)
+        
+        # If still alive, kill it forcefully
+        if still_alive:
+            for p in still_alive:
+                p.kill()
+        
+        return f"Successfully terminated process {pid} ({process_name})."
+    except psutil.NoSuchProcess:
+        return f"No such process: {pid}"
+    except psutil.AccessDenied:
+        return f"Access denied when trying to terminate process {pid}"
+    except Exception as e:
+        return f"Error terminating process: {str(e)}"
+
+def get_running_processes():
+    """
+    Get a list of running processes with their PIDs and names.
+    Returns:
+        List of running processes
+    """
+    try:
+        processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'username', 'status', 'memory_percent']):
+            try:
+                pinfo = proc.info
+                processes.append({
+                    'pid': pinfo['pid'],
+                    'name': pinfo['name'],
+                    'username': pinfo['username'],
+                    'status': pinfo['status'],
+                    'memory': f"{pinfo['memory_percent']:.2f}%"
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        
+        # Sort by PID for consistent output
+        processes.sort(key=lambda x: x['pid'])
+        
+        # Format the output
+        result = ["PID      Name                           User                Status   Memory"]
+        result.append("-" * 75)
+        
+        for proc in processes:
+            result.append(f"{proc['pid']:<8} {proc['name']:<30} {proc['username']:<20} {proc['status']:<8} {proc['memory']}")
+        
+        return "\n".join(result)
+    except Exception as e:
+        return f"Error listing processes: {str(e)}"
+
 # Example usage
 if __name__ == "__main__":
-    res=find_files (directory='.', pattern='*.py', recursive=True)
+    res=find_text_in_files("example", directory=".", file_pattern="*.txt", recursive=True, case_sensitive=False, whole_word=False, line_numbers=True)
     print(res)
